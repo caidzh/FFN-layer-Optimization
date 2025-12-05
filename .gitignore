@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# CUDA compiled files
+*.o
+*.a
+*.ptx
+*.cubin
+
+# PyTorch extensions
+*.pyd
+cuda_kernel/build/
+cuda_kernel/*.so
+cuda_kernel/ffn_cuda_binding.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test results
+benchmark_results.txt
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Virtual environment
+venv/
+env/
+ENV/
