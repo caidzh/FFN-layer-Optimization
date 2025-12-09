@@ -73,7 +73,7 @@ This will check:
 - Project file structure
 - Baseline model functionality
 
-## 运行测试
+## Running Tests
 
 ### 1. Baseline Performance Test
 ```bash
@@ -109,6 +109,6 @@ CUDA kernels need to be implemented in the cuda_kernel directory, including:
 - Maintain numerical precision (relative error < 1e-3)
 - Memory efficient
 
-## 性能基准
+## Performance Baseline
 
 Running the baseline will output execution time for each batch size. The CUDA-optimized version needs to achieve at least 3x speedup over these baselines.

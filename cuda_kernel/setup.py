@@ -22,7 +22,7 @@ setup(
         CUDAExtension(
             name='ffn_cuda_binding',
             sources=[
-                'ffn_cuda.cpp',
+                'ffn_cuda_binding.cpp',
                 'ffn_cuda.cu',
             ],
             extra_compile_args={

@@ -35,6 +35,22 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cmath>
+#include <cstdio>
+#include <cublas_v2.h>
+
+#define checkCudaErrors(call)                                      \
+    do {                                                           \
+        cudaError_t err = call;                                    \
+        if (err != cudaSuccess) {                                  \
+            printf("CUDA error at %s %d: %s\n", __FILE__, __LINE__,\
+                   cudaGetErrorString(err));                       \
+            exit(EXIT_FAILURE);                                    \
+        }                                                          \
+    } while (0)
+
+#define dimX 4096
+#define dimY 12288
+#define TILE_SIZE 4
 
 // TODO: Implement CUDA kernel here
 // 
@@ -57,6 +73,24 @@ __device__ __forceinline__ float gelu(float x) {
     return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
 }
 
+__global__ void elementwise_gelu(float* U, int N) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * TILE_SIZE;
+    if (idx >= N)
+        return;
+#pragma unroll
+    for (int i = 0; i < TILE_SIZE; ++i)
+        U[idx + i] = gelu(U[idx + i]);
+}
+
+__global__ void elementwise_mul(float* U, const float* V, int N) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * TILE_SIZE;
+    if (idx >= N)
+        return;
+#pragma unroll
+    for (int i = 0; i < TILE_SIZE; ++i)
+        U[idx + i] = U[idx + i] * V[idx + i];
+}
+
 // Placeholder kernel launcher
 void ffn_cuda_forward_launcher(
     const float* x,
@@ -72,7 +106,67 @@ void ffn_cuda_forward_launcher(
     // 1. Determine optimal grid/block dimensions
     // 2. Launch the CUDA kernel
     // 3. Handle CUDA errors
-    
+    dim3 block(32, 1, 1);
+    dim3 grid((B * dimY + block.x * TILE_SIZE - 1) / (block.x * TILE_SIZE), 1, 1);
+    float *u, *v;
+    checkCudaErrors(cudaMalloc((void**)&u, B * dimY * sizeof(float)));
+    checkCudaErrors(cudaMalloc((void**)&v, B * dimY * sizeof(float)));
+    cublasHandle_t cublas_handle = nullptr;
+    cublasCreate(&cublas_handle);
+     // dist[27 x N] = M[27 x 17] * moment[17 x N]
+    /* cublasGemmEx(cublas_handle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                sample_num, 27, 17,
+                &alpha,
+                d_moment_matrix, CUDA_R_32F, sample_num,
+                d_transform_matrix, CUDA_R_32F, 17,
+                &beta,
+                d_dist_matrix, CUDA_R_32F, sample_num,
+                CUDA_R_32F,
+                CUBLAS_GEMM_DEFAULT);*/
+    // u[B x dimY] = x[B x dimX] @ Wu[dimX x dimY]
+    float alpha = 1.0f, beta = 0.0f;
+    cublasGemmEx(cublas_handle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                dimY, B, dimX,
+                &alpha,
+                Wu, CUDA_R_32F, dimY,
+                x, CUDA_R_32F, dimX,
+                &beta,
+                u, CUDA_R_32F, dimY,
+                CUDA_R_32F,
+                CUBLAS_GEMM_DEFAULT);
+    // v = x @ Wv
+    cublasGemmEx(cublas_handle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                dimY, B, dimX,
+                &alpha,
+                Wv, CUDA_R_32F, dimY,
+                x, CUDA_R_32F, dimX,
+                &beta,
+                v, CUDA_R_32F, dimY,
+                CUDA_R_32F,
+                CUBLAS_GEMM_DEFAULT);
+    // u = GeLU(u)
+    elementwise_gelu<<<grid, block>>>(u, B * dimY);
+    checkCudaErrors(cudaDeviceSynchronize());
+    // u = u * v
+    elementwise_mul<<<grid, block>>>(u, v, B * dimY);
+    checkCudaErrors(cudaDeviceSynchronize());
+    // y[B x dimX] = u[B x dimY] @ Wo[dimY x dimX]
+    cublasGemmEx(cublas_handle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                dimX, B, dimY,
+                &alpha,
+                Wo, CUDA_R_32F, dimX,
+                u, CUDA_R_32F, dimY,
+                &beta,
+                y, CUDA_R_32F, dimX,
+                CUDA_R_32F,
+                CUBLAS_GEMM_DEFAULT);
+    cublasDestroy(cublas_handle);
     // Placeholder error
     // printf("CUDA kernel not implemented yet\n");
+    checkCudaErrors(cudaGetLastError());
+	checkCudaErrors(cudaDeviceSynchronize());
 }

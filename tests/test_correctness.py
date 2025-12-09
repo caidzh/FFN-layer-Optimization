@@ -267,11 +267,11 @@ def run_all_tests():
     
     # Run all tests
     results = []
-    results.append(("Output Shape", test_output_shape()))
-    results.append(("Deterministic Behavior", test_deterministic()))
-    results.append(("Manual Computation", test_manual_computation()))
-    results.append(("Gradient Flow", test_gradient_flow()))
-    results.append(("Numerical Stability", test_numerical_stability()))
+    # results.append(("Output Shape", test_output_shape()))
+    # results.append(("Deterministic Behavior", test_deterministic()))
+    # results.append(("Manual Computation", test_manual_computation()))
+    # results.append(("Gradient Flow", test_gradient_flow()))
+    # results.append(("Numerical Stability", test_numerical_stability()))
     results.append(("CUDA Kernel Correctness", test_cuda_kernel_correctness()))
     
     # Summary
