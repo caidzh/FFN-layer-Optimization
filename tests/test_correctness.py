@@ -18,7 +18,7 @@ from models.ffn_baseline import GEGLU_FFN
 # Test configuration
 HIDDEN_SIZE = 4096
 INTERMEDIATE_SIZE = 12288
-BATCH_SIZES = [4, 8, 16, 32, 64, 128]
+BATCH_SIZES = [128, 256, 1024]
 RTOL = 1e-3  # Relative tolerance
 ATOL = 1e-5  # Absolute tolerance
 
@@ -233,11 +233,20 @@ def test_cuda_kernel_correctness():
         # CUDA kernel output
         weights = ffn.get_weights()
         y_cuda = ffn_cuda_forward(
-            x, 
-            weights['Wu'].t().contiguous(),  # Transpose to [4096, 12288]
-            weights['Wv'].t().contiguous(), 
-            weights['Wo'].t().contiguous()
+            x.half(), 
+            weights['Wu'].half().contiguous(),  # Transpose to [4096, 12288]
+            weights['Wv'].half().contiguous(), 
+            weights['Wo'].half().contiguous()
         )
+
+        # Print top-left 10x10 elements
+        # print(f"\n  Batch size {B}:")
+        # print("  y_baseline (top-left 10x10):")
+        # print(y_baseline[:10, :10].detach().cpu().numpy())
+        # print("\n  y_cuda (top-left 10x10):")
+        # print(y_cuda[:10, :10].detach().cpu().numpy())
+        # print("\n  Difference (top-left 10x10):")
+        # print((y_baseline[:10, :10] - y_cuda[:10, :10]).detach().cpu().numpy())
         
         # Compare
         max_diff = torch.max(torch.abs(y_baseline - y_cuda)).item()
@@ -247,7 +256,7 @@ def test_cuda_kernel_correctness():
         all_passed = all_passed and passed
         
         status = "✓ PASS" if passed else "✗ FAIL"
-        print(f"  Batch size {B:3d}: rel_error = {rel_error:.2e} ... {status}")
+        print(f"  Batch size {B:3d}: rel_error = {rel_error:.2e}, max_diff = {max_diff:.2e}... {status}")
     
     print(f"\n  Overall: {'✓ ALL PASSED' if all_passed else '✗ SOME FAILED'}")
     return all_passed

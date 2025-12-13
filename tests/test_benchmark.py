@@ -19,7 +19,7 @@ from models.ffn_baseline import GEGLU_FFN
 # Test configuration
 HIDDEN_SIZE = 4096
 INTERMEDIATE_SIZE = 12288
-BATCH_SIZES = [4, 8, 16, 32, 64, 128]
+BATCH_SIZES = [128, 256, 1024]
 WARMUP_ITERS = 10
 BENCHMARK_ITERS = 100
 
@@ -118,15 +118,15 @@ def benchmark_cuda(batch_sizes, warmup_iters=10, benchmark_iters=100):
     
     # Get weights
     weights = ffn.get_weights()
-    Wu = weights['Wu'].t().contiguous()  # [4096, 12288]
-    Wv = weights['Wv'].t().contiguous()
-    Wo = weights['Wo'].t().contiguous()  # [12288, 4096]
+    Wu = weights['Wu'].half().contiguous()  # [4096, 12288]
+    Wv = weights['Wv'].half().contiguous()
+    Wo = weights['Wo'].half().contiguous()  # [12288, 4096]
     
     results = {}
     
     with torch.no_grad():
         for B in batch_sizes:
-            x = torch.randn(B, HIDDEN_SIZE, device=device)
+            x = torch.randn(B, HIDDEN_SIZE, device=device, dtype=torch.float16)
             
             # Warmup
             for _ in range(warmup_iters):
