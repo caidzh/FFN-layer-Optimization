@@ -120,7 +120,7 @@ def benchmark_cuda(batch_sizes, warmup_iters=10, benchmark_iters=100):
     weights = ffn.get_weights()
     Wu = weights['Wu'].half().contiguous()  # [4096, 12288]
     Wv = weights['Wv'].half().contiguous()
-    Wo = weights['Wo'].half().contiguous()  # [12288, 4096]
+    Wo = weights['Wo'].half().T.contiguous()  # [12288, 4096]
     
     results = {}
     

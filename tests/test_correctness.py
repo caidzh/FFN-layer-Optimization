@@ -236,7 +236,7 @@ def test_cuda_kernel_correctness():
             x.half(), 
             weights['Wu'].half().contiguous(),  # Transpose to [4096, 12288]
             weights['Wv'].half().contiguous(), 
-            weights['Wo'].half().contiguous()
+            weights['Wo'].half().T.contiguous()
         )
 
         # Print top-left 10x10 elements
