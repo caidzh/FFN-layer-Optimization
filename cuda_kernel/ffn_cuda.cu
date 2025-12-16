@@ -621,6 +621,7 @@ void ffn_cuda_forward_launcher_efficient_GEMM(
 }
 
 // calculate [u v] = x @ [Wu Wv] and u = GeLU(u) * v
+// make sure shared memory is enough to hold two B x kTileK tiles before using this kernel
 template <typename Config>
 __global__ void matmul_gelu_fuse_kernel(
     const void* x,
@@ -866,11 +867,311 @@ __global__ void matmul_gelu_fuse_kernel(
     }
 }
 
+// calculate u = x @ Wu, then v = x @ Wv (read A twice), then u = GeLU(u) * v
+template <typename Config>
+__global__ void matmul_gelu_fuse_kernel_read_A_twice(
+    const void* x,
+    const void* Wu,
+    const void* Wv,
+    void* u,
+    void* v,
+    int m,
+    int n,
+    int k
+) {
+    using namespace cute;
+    using X = Underscore;
+
+    using T_input = typename Config::ElementA;
+    using T_output = typename Config::ElementC;
+    using SmemLayoutA = typename Config::SmemLayoutA;
+    using SmemLayoutB = typename Config::SmemLayoutB;
+    using SmemLayoutC = typename Config::SmemLayoutC;
+    using TiledMMA = typename Config::MMA;
+
+    using S2RCopyAtomA = typename Config::S2RCopyAtomA;
+    using S2RCopyAtomB = typename Config::S2RCopyAtomB;
+    using G2SCopyA = typename Config::G2SCopyA;
+    using G2SCopyB = typename Config::G2SCopyB;
+    using R2SCopyAtomC = typename Config::R2SCopyAtomC;
+    using S2GCopyAtomC = typename Config::S2GCopyAtomC;
+    using S2GCopyC = typename Config::S2GCopyC;
+
+    constexpr int kTileM = Config::kTileM;
+    constexpr int kTileN = Config::kTileN;
+    constexpr int kTileK = Config::kTileK;
+    constexpr int kStage = Config::kStage;
+
+    extern __shared__ T_input shm_data[];
+
+    T_input *Ashm = shm_data;
+    T_input *Bshm = shm_data + cute::cosize(SmemLayoutA{});
+
+    int idx = threadIdx.x;
+    int ix = blockIdx.x;
+    int iy = blockIdx.y;
+
+    // ==================== First GEMM: u = x @ Wu ====================
+    // use Tensor notation to represent device pointer + dimension
+    Tensor A = make_tensor(make_gmem_ptr((T_input*)x), make_shape(m, k),
+                            make_stride(k, Int<1>{}));  // (M, K)
+    Tensor B = make_tensor(make_gmem_ptr((T_input*)Wu), make_shape(n, k),
+                            make_stride(k, Int<1>{}));  // (N, K)
+    Tensor C1 = make_tensor(make_gmem_ptr((T_output*)u), make_shape(m, n),
+                            make_stride(n, Int<1>{}));  // (M, N)
+
+    // slice the tensor to small one which is used for current thread block.
+    Tensor gA = local_tile(A, make_tile(Int<kTileM>{}, Int<kTileK>{}),
+                            make_coord(iy, _));  // (kTileM, kTileK, k)
+    Tensor gB = local_tile(B, make_tile(Int<kTileN>{}, Int<kTileK>{}),
+                            make_coord(ix, _));  // (kTileN, kTileK, k)
+    Tensor gC1 = local_tile(C1, make_tile(Int<kTileM>{}, Int<kTileN>{}),
+                            make_coord(iy, ix));  // (kTileM, kTileN)
+
+    // shared memory
+    auto sA = make_tensor(make_smem_ptr(Ashm),
+                            SmemLayoutA{});  // (kTileM, kTileK, kStage)
+    auto sB = make_tensor(make_smem_ptr(Bshm),
+                            SmemLayoutB{});  // (kTileN, kTileK, kStage)
+
+    // dispatch TileA/TileB/TileC mma tensor into thread fragment via partition
+    TiledMMA tiled_mma;
+    auto thr_mma = tiled_mma.get_slice(idx);
+    auto tCrA = thr_mma.partition_fragment_A(gA(_, _, 0));  // (MMA, MMA_M, MMA_K)
+    auto tCrB = thr_mma.partition_fragment_B(gB(_, _, 0));  // (MMA, MMA_N, MMA_K)
+    auto tCrC1 = thr_mma.partition_fragment_C(gC1);           // (MMA, MMA_M, MMA_N)
+
+    // fill zero for accumulator
+    clear(tCrC1);
+
+    // gmem -cp.async-> shm -ldmatrix-> reg
+    auto s2r_tiled_copy_a = make_tiled_copy_A(S2RCopyAtomA{}, tiled_mma);
+    auto s2r_thr_copy_a = s2r_tiled_copy_a.get_slice(idx);
+    auto tAsA = s2r_thr_copy_a.partition_S(sA);  // (CPY, CPY_M, CPY_K, kStage)
+    auto tCrA_view = s2r_thr_copy_a.retile_D(tCrA);  // (CPY, CPY_M, CPY_K)
+
+    auto s2r_tiled_copy_b = make_tiled_copy_B(S2RCopyAtomB{}, tiled_mma);
+    auto s2r_thr_copy_b = s2r_tiled_copy_b.get_slice(idx);
+    auto tBsB = s2r_thr_copy_b.partition_S(sB);  // (CPY, CPY_M, CPY_K, kStage)
+    auto tCrB_view = s2r_thr_copy_b.retile_D(tCrB);  // (CPY, CPY_M, CPY_K)
+
+    G2SCopyA g2s_tiled_copy_a;
+    auto g2s_thr_copy_a = g2s_tiled_copy_a.get_slice(idx);
+    auto tAgA_copy = g2s_thr_copy_a.partition_S(gA);  // (CPY, CPY_M, CPY_K, k)
+    auto tAsA_copy =
+        g2s_thr_copy_a.partition_D(sA);  // (CPY, CPY_M, CPY_K, kStage)
+
+    G2SCopyB g2s_tiled_copy_b;
+    auto g2s_thr_copy_b = g2s_tiled_copy_b.get_slice(idx);
+    auto tBgB_copy = g2s_thr_copy_b.partition_S(gB);  // (CPY, CPY_N, CPY_K, k)
+    auto tBsB_copy =
+        g2s_thr_copy_b.partition_D(sB);  // (CPY, CPY_N, CPY_K, kStage)
+
+    // ring buffer index
+    int itile_to_read = 0;
+    int ismem_read = 0;
+    int ismem_write = 0;
+
+    // submit kStage - 1 tile
+    // gmem -> shm
+    #pragma unroll
+    for (int istage = 0; istage < kStage - 1; ++istage) {
+        cute::copy(g2s_tiled_copy_a, tAgA_copy(_, _, _, istage),
+                tAsA_copy(_, _, _, istage));
+        cute::copy(g2s_tiled_copy_b, tBgB_copy(_, _, _, istage),
+                tBsB_copy(_, _, _, istage));
+        cp_async_fence();
+
+        ++itile_to_read;
+        ++ismem_write;
+    }
+
+    cp_async_wait<kStage - 2>();
+    __syncthreads();
+
+    int ik = 0;
+    // smem -> reg
+    cute::copy(s2r_tiled_copy_a, tAsA(_, _, ik, ismem_read), tCrA_view(_, _, ik));
+    cute::copy(s2r_tiled_copy_b, tBsB(_, _, ik, ismem_read), tCrB_view(_, _, ik));
+
+    // loop over k: i. load tile, ii. mma
+    int ntile = k / kTileK;
+    #pragma unroll 1
+    for (int itile = 0; itile < ntile; ++itile) {
+        int nk = size<2>(tCrA);
+
+    #pragma unroll
+        for (int ik = 0; ik < nk; ++ik) {
+        int ik_next = (ik + 1) % nk;
+
+        if (ik == nk - 1) {
+            cp_async_wait<kStage - 2>();
+            __syncthreads();
+
+            ismem_read = (ismem_read + 1) % kStage;
+        }
+
+        // shm -> reg s[itile][ik + 1] -> r[ik + 1]
+        cute::copy(s2r_tiled_copy_a, tAsA(_, _, ik_next, ismem_read),
+                    tCrA_view(_, _, ik_next));
+        cute::copy(s2r_tiled_copy_b, tBsB(_, _, ik_next, ismem_read),
+                    tCrB_view(_, _, ik_next));
+
+        if (ik == 0) {
+            if (itile_to_read < ntile) {
+            cute::copy(g2s_tiled_copy_a, tAgA_copy(_, _, _, itile_to_read),
+                        tAsA_copy(_, _, _, ismem_write));
+            cute::copy(g2s_tiled_copy_b, tBgB_copy(_, _, _, itile_to_read),
+                        tBsB_copy(_, _, _, ismem_write));
+
+            ++itile_to_read;
+            ismem_write = (ismem_write + 1) % kStage;
+            }
+
+            cp_async_fence();
+        }
+
+        cute::gemm(tiled_mma, tCrC1, tCrA(_, _, ik), tCrB(_, _, ik), tCrC1);
+        }  // for ik
+    }    // itile
+
+    // ==================== Second GEMM: v = x @ Wv ====================
+    // Update B to point to Wv
+    B = make_tensor(make_gmem_ptr((T_input*)Wv), make_shape(n, k),
+                     make_stride(k, Int<1>{}));  // (N, K)
+    Tensor C2 = make_tensor(make_gmem_ptr((T_output*)v), make_shape(m, n),
+                            make_stride(n, Int<1>{}));  // (M, N)
+
+    // Update tensors for second GEMM
+    gB = local_tile(B, make_tile(Int<kTileN>{}, Int<kTileK>{}),
+                     make_coord(ix, _));  // (kTileN, kTileK, k)
+    Tensor gC2 = local_tile(C2, make_tile(Int<kTileM>{}, Int<kTileN>{}),
+                            make_coord(iy, ix));  // (kTileM, kTileN)
+    
+    auto tCrC2 = thr_mma.partition_fragment_C(gC2);  // (MMA, MMA_M, MMA_N)
+    clear(tCrC2);
+
+    // Update copy descriptors for new B (Wv)
+    tBgB_copy = g2s_thr_copy_b.partition_S(gB);  // (CPY, CPY_N, CPY_K, k)
+
+    // Reset ring buffer
+    itile_to_read = 0;
+    ismem_read = 0;
+    ismem_write = 0;
+
+    // submit kStage - 1 tile for second GEMM
+    #pragma unroll
+    for (int istage = 0; istage < kStage - 1; ++istage) {
+        cute::copy(g2s_tiled_copy_a, tAgA_copy(_, _, _, istage),
+                tAsA_copy(_, _, _, istage));
+        cute::copy(g2s_tiled_copy_b, tBgB_copy(_, _, _, istage),
+                tBsB_copy(_, _, _, istage));
+        cp_async_fence();
+
+        ++itile_to_read;
+        ++ismem_write;
+    }
+
+    cp_async_wait<kStage - 2>();
+    __syncthreads();
+
+    ik = 0;
+    cute::copy(s2r_tiled_copy_a, tAsA(_, _, ik, ismem_read), tCrA_view(_, _, ik));
+    cute::copy(s2r_tiled_copy_b, tBsB(_, _, ik, ismem_read), tCrB_view(_, _, ik));
+
+    // Second GEMM loop
+    #pragma unroll 1
+    for (int itile = 0; itile < ntile; ++itile) {
+        int nk = size<2>(tCrA);
+
+    #pragma unroll
+        for (int ik = 0; ik < nk; ++ik) {
+        int ik_next = (ik + 1) % nk;
+
+        if (ik == nk - 1) {
+            cp_async_wait<kStage - 2>();
+            __syncthreads();
+
+            ismem_read = (ismem_read + 1) % kStage;
+        }
+
+        cute::copy(s2r_tiled_copy_a, tAsA(_, _, ik_next, ismem_read),
+                    tCrA_view(_, _, ik_next));
+        cute::copy(s2r_tiled_copy_b, tBsB(_, _, ik_next, ismem_read),
+                    tCrB_view(_, _, ik_next));
+
+        if (ik == 0) {
+            if (itile_to_read < ntile) {
+            cute::copy(g2s_tiled_copy_a, tAgA_copy(_, _, _, itile_to_read),
+                        tAsA_copy(_, _, _, ismem_write));
+            cute::copy(g2s_tiled_copy_b, tBgB_copy(_, _, _, itile_to_read),
+                        tBsB_copy(_, _, _, ismem_write));
+
+            ++itile_to_read;
+            ismem_write = (ismem_write + 1) % kStage;
+            }
+
+            cp_async_fence();
+        }
+
+        cute::gemm(tiled_mma, tCrC2, tCrA(_, _, ik), tCrB(_, _, ik), tCrC2);
+        }  // for ik
+    }    // itile
+    __syncthreads();
+    
+
+    // ==================== Apply GELU fusion: u = GELU(u) * v ====================
+#pragma unroll
+    for (int i = 0; i < size(tCrC1); ++i) {
+        float val1 = static_cast<float>(tCrC1(i));
+        float val2 = static_cast<float>(tCrC2(i));
+        tCrC1(i) = static_cast<T_output>(gelu(val1) * val2);
+    }
+
+    // ==================== Write result back to global memory ====================
+    // use less shared memory as a scratchpad tile to use large wide instruction
+    auto sC = make_tensor(sA(_, _, ismem_read).data(), SmemLayoutC{});
+
+    auto r2s_tiled_copy_c = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma);
+    auto r2s_thr_copy_c = r2s_tiled_copy_c.get_slice(idx);
+    auto tCrC_r2s = r2s_thr_copy_c.retile_S(tCrC1);   // (CPY, CPY_M, CPY_N)
+    auto tCsC_r2s = r2s_thr_copy_c.partition_D(sC);  // (CPY, _1, _1, pipe)
+
+    S2GCopyC s2g_tiled_copy_c;
+    auto s2g_thr_copy_c = s2g_tiled_copy_c.get_thread_slice(idx);
+    auto tCsC_s2g = s2g_thr_copy_c.partition_S(sC);  // (CPY, _1, _1, pipe)
+    auto tCgC_s2g = s2g_thr_copy_c.partition_D(gC1);  // (CPY, CPY_M, CPY_N)
+
+    auto tCgC_s2gx = group_modes<1, 3>(tCgC_s2g);  // (CPY_, CPY_MN)
+    auto tCrC_r2sx = group_modes<1, 3>(tCrC_r2s);  // (CPY_, CPY_MN)
+
+    int step = size<3>(tCsC_r2s);  // pipe
+    #pragma unroll
+    for (int i = 0; i < size<1>(tCrC_r2sx); i += step) {
+        // reg -> shm
+    #pragma unroll
+        for (int j = 0; j < step; ++j) {
+        auto t = make_tensor_like<T_output>(tCrC_r2sx(_, i + j));
+        cute::copy(tCrC_r2sx(_, i + j), t);
+        cute::copy(r2s_tiled_copy_c, t, tCsC_r2s(_, 0, 0, j));
+        }
+        __syncthreads();
+
+    #pragma unroll
+        // shm -> global
+        for (int j = 0; j < step; ++j) {
+        cute::copy(s2g_tiled_copy_c, tCsC_s2g(_, 0, 0, j), tCgC_s2gx(_, i + j));
+        }
+
+        __syncthreads();
+    }
+}
+
 // fuse the first 2 GEMM and GeLU operations
 // only test for B >= 128
 // input: x [B, dimX], Wu[dimY, dimX], Wv[dimY, dimX], Wo[dimY, dimX] (Wo is transposed)
 // output: y [B, dimX]
-void ffn_cuda_forward_launcher(
+void ffn_cuda_forward_launcher_128_128_32_3(
     const half_t* x,
     const half_t* Wu,
     const half_t* Wv,
@@ -889,20 +1190,73 @@ void ffn_cuda_forward_launcher(
     gemm_config::GemmConfig<
             SM80_16x8x16_F16F16F16F16_TN,
             half_t, half_t, half_t,
-            16, 128, 32, 3> config;
+            128, 128, 32, 3> config;
 
     dim3 block = config.kThreadNum;
     dim3 grid((dimY + config.kTileN - 1) / config.kTileN,
                 (B + config.kTileM - 1) / config.kTileM);
     int shm_size = config.kShmSize;
 
-    printf("%d\n", shm_size);
+    cudaFuncSetAttribute(GEMM<decltype(config)>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+
+    // u = x @ Wu
+    matmul_gelu_fuse_kernel_read_A_twice<decltype(config)><<<grid, block, shm_size>>>(x, Wu, Wv, u, v, B, dimY, dimX);
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaDeviceSynchronize());
+    cublasHandle_t cublas_handle = nullptr;
+    cublasCreate(&cublas_handle);
+    float alpha = 1.0f, beta = 0.0f;
+    cublasGemmEx(cublas_handle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                dimX, B, dimY,
+                &alpha,
+                Wo, CUDA_R_16F, dimX,
+                u, CUDA_R_16F, dimY,
+                &beta,
+                y, CUDA_R_32F, dimX,
+                CUDA_R_32F,
+                CUBLAS_GEMM_DEFAULT);
+    cublasDestroy(cublas_handle);
+    cudaFree(u);
+    cudaFree(v);
+}
+
+// fuse the first 2 GEMM and GeLU operations
+// only test for B >= 128
+// input: x [B, dimX], Wu[dimY, dimX], Wv[dimY, dimX], Wo[dimY, dimX] (Wo is transposed)
+// output: y [B, dimX]
+void ffn_cuda_forward_launcher_64_128_64_2(
+    const half_t* x,
+    const half_t* Wu,
+    const half_t* Wv,
+    const half_t* Wo,
+    float* y,
+    int B,
+    cudaStream_t stream
+) {
+    using namespace cute;
+
+    half_t *u, *v;
+    checkCudaErrors(cudaMalloc((void**)&u, B * dimY * sizeof(half_t)));
+    checkCudaErrors(cudaMalloc((void**)&v, B * dimY * sizeof(half_t)));
+
+    // Initialise settings for MMA
+    gemm_config::GemmConfig<
+            SM80_16x8x16_F16F16F16F16_TN,
+            half_t, half_t, half_t,
+            64, 128, 64, 2> config;
+
+    dim3 block = config.kThreadNum;
+    dim3 grid((dimY + config.kTileN - 1) / config.kTileN,
+                (B + config.kTileM - 1) / config.kTileM);
+    int shm_size = config.kShmSize;
 
     cudaFuncSetAttribute(GEMM<decltype(config)>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
     // u = x @ Wu
-    matmul_gelu_fuse_kernel<decltype(config)><<<grid, block, shm_size>>>(x, Wu, Wv, u, v, B, dimY, dimX);
+    matmul_gelu_fuse_kernel_read_A_twice<decltype(config)><<<grid, block, shm_size>>>(x, Wu, Wv, u, v, B, dimY, dimX);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
     cublasHandle_t cublas_handle = nullptr;

@@ -43,3 +43,6 @@ Thumbs.db
 venv/
 env/
 ENV/
+
+profile.py
+ncu_profiles/

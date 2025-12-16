@@ -103,8 +103,8 @@ namespace gemm_config {
 
         static constexpr int kThreadNum = size(MMA{});
         static constexpr int shm_size_AB =
-            cute::cosize(SmemLayoutA{}) + cute::cosize(SmemLayoutB{}) * 2;
-        static constexpr int shm_size_C = cute::cosize(SmemLayoutC{}) * 2;
+            cute::cosize(SmemLayoutA{}) + cute::cosize(SmemLayoutB{});
+        static constexpr int shm_size_C = cute::cosize(SmemLayoutC{});
 
         static constexpr int kShmSize =
             cute::max(shm_size_AB, shm_size_C) * sizeof(ElementC);

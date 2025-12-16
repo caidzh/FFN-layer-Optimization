@@ -18,7 +18,7 @@ from models.ffn_baseline import GEGLU_FFN
 # Test configuration
 HIDDEN_SIZE = 4096
 INTERMEDIATE_SIZE = 12288
-BATCH_SIZES = [128, 256, 1024]
+BATCH_SIZES = [128, 256, 1024, 4096]
 RTOL = 1e-3  # Relative tolerance
 ATOL = 1e-5  # Absolute tolerance
 
